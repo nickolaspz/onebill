@@ -1,0 +1,6 @@
+{
+    "require": {
+        "jmeyering/hal-explorer": "*",
+        "guzzlehttp/guzzle": "^6.3"
+    }
+}

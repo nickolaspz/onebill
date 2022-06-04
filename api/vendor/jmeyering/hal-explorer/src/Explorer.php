@@ -1,0 +1,399 @@
+<?php
+
+namespace HalExplorer;
+
+use HalExplorer\ClientAdapters\AdapterInterface;
+use HalExplorer\Exceptions\LinkNotFoundException;
+use HalExplorer\Exceptions\DeprecatedLinkException;
+use HalExplorer\Hypermedia\ParserInterface;
+use HalExplorer\Hypermedia\Parser as HypermediaParser;
+use HalExplorer\Hypermedia\UriTemplate;
+use Psr\Http\Message\ResponseInterface;
+
+/**
+ * Explorer handles all requests to the HAL Api. It follows valid HATEOAS
+ * HAL links very well, and it is flexible to allow a user to craft requests
+ * when a response body isn't exactly up to HAL spec.
+ *
+ * The explorer works exclusively with PSR7 Response/Request messages.
+ * All requests return a PSR7 ResponseInterface. This should help with
+ * portability and managing future changes.
+ *
+ * To get the parsed object (For single resources) or array (for a collection
+ * of resources) from a result you can use the `getParsedBody` method.
+ *
+ * ```php
+ * $resourceResponse = $explorer->makeRequest("get", "/resources"); // returns ResponseInterface
+ * $resource = $explorer->getParsedBody($resourceResponse); // returns stdClass|array
+ * ```
+ *
+ *
+ * @author Jared Meyering
+ *
+ */
+class Explorer
+{
+
+    /**
+     * The base api url
+     *
+     * @var string
+     */
+    protected $baseUrl;
+
+    /**
+     * The adapter to be used to make all requests to the HAL api
+     *
+     * @var AdapterInterface
+     */
+    protected $adapter;
+
+    /**
+     * The parser that will process all HAL links, embeds, and curies.
+     *
+     * @var ParserInterface
+     */
+    protected $parser;
+
+    /**
+     * How to add default values to the currently established
+     *
+     * @var \Closure
+     */
+    protected $defaults;
+
+
+    /**
+     * Make a request to the entrypoint of the api.
+     *
+     * @see makeRequest
+     * @param array $options See self::makeRequest for details.
+     * @return ResponseInterface
+     */
+    public function enter(array $options = [])
+    {
+        return $this->makeRequest("get", "/", $options);
+    }
+
+    /**
+     * Make a request to the api. Automatically adds default options to the
+     * request.
+     *
+     * @todo Really dry this up. This is a CRAPpy method.
+     *
+     * @param string $method  The method used to make the request
+     * @param string $uri     The uri to hit, may be absolute or relative to the
+     *     baseUrl
+     * @param array  $options An array of options. We use
+     *     {@link http://guzzle.readthedocs.org/en/latest/request-options.html guzzle formatted}
+     *     options and require adapters to morph this data to match their
+     *     specific http client implementations
+     *
+     * @return ResponseInterface
+     */
+    public function makeRequest($method, $uri, array $options = [])
+    {
+        //Trim leading slash if it exists
+        $uri = ltrim($uri, "/");
+
+        $parsed = parse_url($uri);
+
+        // If this is not an absolute URI we need to generate the fully qualified
+        // internal url using the base url that we have internally.
+        if (!isset($parsed["scheme"]) && isset($parsed["path"])) {
+            $uri = $this->getBaseUrl() . "/" . $uri;
+        }
+
+        // If the link href has query parameters we want to split those out and
+        // send them appropriately. Maybe dry this up a bit later when
+        // appropriate.
+        if (isset($parsed["query"])) {
+            $query = [];
+            parse_str($parsed["query"], $query);
+
+            $options["query"] = isset($options["query"]) ? $options["query"] + $query : $query;
+
+            // Because we pass the query string as an $option parameter. Remove it
+            // from the uri we are requesting.
+            $uri = preg_replace('/\?.*/', '', $uri);
+        }
+
+        //Passed in options take precedence over default options.
+        $options = array_merge_recursive($this->getDefaults(), $options);
+
+        $response = $this->getAdapter()->$method($uri, $options);
+
+        return $response;
+    }
+
+    /**
+     * Return a parsed representation of the json body of a response
+     *
+     * @param ResponseInterface $response
+     *
+     * @return array|\stdClass
+     */
+    public function getParsedBody(ResponseInterface $response)
+    {
+
+        return json_decode($response->getBody());
+    }
+
+    /**
+     * Follow a link using the "GET" method.
+     *
+     * @see followLink
+     *
+     * @param ResponseInterface $response The response object containing the links
+     * @param string            $id       The identifier of the link to follow
+     * @param array             $options  Any options to be passed to the adapter
+     *
+     * @return ResponseInterface
+     */
+    public function getRelation(ResponseInterface $response, $id, array $options = [])
+    {
+        return $this->followLink("get", $response, $id, $options);
+    }
+
+    /**
+     * Follow a link using the "POST" method.
+     *
+     * @see followLink
+     *
+     * @param ResponseInterface $response The response object containing the links
+     * @param string            $id       The identifier of the link to follow
+     * @param array             $options  Any options to be passed to the adapter
+     *
+     * @return ResponseInterface
+     */
+    public function createRelation(ResponseInterface $response, $id, array $options = [])
+    {
+        return $this->followLink("post", $response, $id, $options);
+    }
+
+    /**
+     * Follow a link using the "PUT" method.
+     *
+     * @see followLink
+     *
+     * @param ResponseInterface $response The response object containing the links
+     * @param string            $id       The identifier of the link to follow
+     * @param array             $options  Any options to be passed to the adapter
+     *
+     * @return ResponseInterface
+     */
+    public function updateRelation(ResponseInterface $response, $id, array $options = [])
+    {
+        return $this->followLink("put", $response, $id, $options);
+    }
+
+    /**
+     * Follow a link using the "PATCH" method.
+     *
+     * @see followLink
+     *
+     * @param ResponseInterface $response The response object containing the links
+     * @param string            $id       The identifier of the link to follow
+     * @param array             $options  Any options to be passed to the adapter
+     *
+     * @return ResponseInterface
+     */
+    public function patchUpdateRelation(ResponseInterface $response, $id, array $options = [])
+    {
+        return $this->followLink("patch", $response, $id, $options);
+    }
+
+    /**
+     * Follow a link using the "DELETE" method.
+     *
+     * @see followLink
+     *
+     * @param ResponseInterface $response The response object containing the links
+     * @param string            $id       The identifier of the link to follow
+     * @param array             $options  Any options to be passed to the adapter
+     *
+     * @return ResponseInterface
+     */
+    public function deleteRelation(ResponseInterface $response, $id, array $options = [])
+    {
+        return $this->followLink("delete", $response, $id, $options);
+    }
+
+    /**
+     * Follow a link that lives on a Response.
+     *
+     * @see makeRequest
+     *
+     * @param string            $method   The http method to use when following
+     *                                    the link.
+     * @param ResponseInterface $response The response containing the links
+     * @param string            $id       The identifier of the link
+     * @param array             $options  Array of options that will be passed
+     *                                    to the adapter
+     *
+     * @throws LinkNotFoundException   If the link we want to follow doesn't exist
+     *                                 on the response
+     * @throws DeprecatedLinkException If the link has been marked as deprecated
+     *
+     * @return ResponseInterface
+     */
+    protected function followLink($method, ResponseInterface $response, $id, array $options = [])
+    {
+        $hypermediaParser = $this->getParser();
+        $link = $hypermediaParser->getLink($response, $id);
+
+        if ($link === null) {
+            throw new LinkNotFoundException("Link \"{$id}\" not found in response");
+        }
+
+        if (property_exists($link, "deprecation")) {
+            throw new DeprecatedLinkException("{$id} link has been deprecated, see {$link->deprecation} for more information");
+        }
+
+        /**
+         * This allows a specifically declared type property to be se on the HAL
+         * endpoint, and will set the Accept header appropriately.
+         */
+        if (property_exists($link, "type")) {
+            $this->setDefaults(function($defaults) use ($link) {
+                $defaults["headers"]["Accept"] = $link->type;
+
+                return $defaults;
+            });
+        }
+
+        $href = $link->href;
+
+        // Technically an api must expose the "templated" property on a link for
+        // it to be considered a uri template. However, I've rarely seen this
+        // used in practice, so first, check for the templated property, but if
+        // it doesn't exist, we will still template if the user has passesd in
+        // the template option.
+        //
+        // @TODO: Better document this functionality
+        if (
+            (property_exists($link, "templated") && $link->templated) ||
+            isset($options["template"])
+        ) {
+            $uriTemplate = new UriTemplate();
+            $href = $uriTemplate->template($href, $options["template"]);
+        }
+
+        return $this->makeRequest($method, $href, $options);
+    }
+
+    /**
+     * Get adapter
+     *
+     * @return AdapterInterface
+     */
+    public function getAdapter()
+    {
+        return $this->adapter;
+    }
+
+    /**
+     * Set adapter.
+     *
+     * @param $adapter AdapterInterface
+     *
+     * @return self
+     */
+    public function setAdapter($adapter)
+    {
+        $this->adapter = $adapter;
+
+        return $this;
+    }
+
+    /**
+     * Set the hypermedia parser
+     *
+     * @param $parser ParserInterface
+     *
+     * @return self
+     */
+    public function setParser(ParserInterface $parser) {
+        $this->parser = $parser;
+
+        return $this;
+    }
+
+    /**
+     * Retrieve the set parser on the explorer, or return the default parser.
+     *
+     * @return ParserInterface
+     */
+    public function getParser() {
+        $parser = $this->parser;
+        if (is_null($this->parser)) {
+            $parser = new HypermediaParser();
+        }
+
+        return $parser;
+    }
+
+
+    /**
+     * Modify the existing defaults array. To meet your needs.
+     *
+     * @param \Closure $def The closure should accept a single array parameter which
+     * is the library default options array for the http request. Modify it or
+     * trash it -- I don't care.
+     *
+     * @return self
+     */
+    public function setDefaults(\Closure $def)
+    {
+        $this->defaults = $def;
+
+        return $this;
+    }
+
+    /**
+     * Get baseUrl
+     *
+     * @return string
+     */
+    public function getBaseUrl()
+    {
+        return $this->baseUrl;
+    }
+
+    /**
+     * Set baseUrl.
+     *
+     * @param string $baseUrl
+     *
+     * @return self
+     */
+    public function setBaseUrl($baseUrl)
+    {
+        $this->baseUrl = $baseUrl;
+
+        return $this;
+    }
+
+    /**
+     * Return the default http options.
+     *
+     * @return array
+     */
+    protected function getDefaults()
+    {
+        $defaults = [
+            "query" => [],
+            "headers" => [
+                "Content-Type" => "application/json",
+                "Accept" => "application/hal+json",
+            ],
+        ];
+
+        if (!empty($this->defaults)) {
+            $defaults = call_user_func($this->defaults, $defaults);
+        }
+
+        return $defaults;
+    }
+
+}

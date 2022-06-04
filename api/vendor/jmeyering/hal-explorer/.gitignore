@@ -1,0 +1,4 @@
+vendor/
+public/
+*.sw*
+composer.lock
